@@ -32,7 +32,6 @@
 ;; (add-to-list 'load-path "/path/to/project-tmux/")
 ;; (require 'project-tmux)
 ;; (require 'project)
-;; (requi)
 ;; (keymap-set project-prefix-map "t" #'project-tmux)
 ;; (add-to-list 'project-switch-commands '(project-tmux "Tmux" nil))
 
