@@ -34,6 +34,9 @@
 ;; (require 'project)
 ;; (keymap-set project-prefix-map "t" #'project-tmux)
 ;; (add-to-list 'project-switch-commands '(project-tmux "Tmux" nil))
+;;
+;; In `project-tmux' buffers, `project-tmux-mode' binds:
+;; - C-c C-v: `project-tmux-capture-pane'
 
 ;;; Code:
 
@@ -45,11 +48,24 @@
 (declare-function project-root "project" (project))
 
 (defvar eat-buffer-name)
+(defvar-local project-tmux--session-base nil)
+(defvar-local project-tmux--view-index nil)
+(defvar project-tmux-mode-map
+  (let ((map (make-sparse-keymap)))
+    (keymap-set map "C-c C-v" #'project-tmux-capture-pane)
+    map)
+  "Keymap for `project-tmux-mode'.")
 
 (defgroup project-tmux nil
   "Project-local tmux views in Eat."
   :group 'tools
   :prefix "project-tmux-")
+
+(define-minor-mode project-tmux-mode
+  "Minor mode enabled in buffers created by `project-tmux'."
+  :init-value nil
+  :lighter nil
+  :keymap project-tmux-mode-map)
 
 (defcustom project-tmux-identity-strategy 'path
   "How `project-tmux' computes the base tmux session name.
@@ -70,6 +86,28 @@ The value can be one of:
 
 (defconst project-tmux--id-file-name ".project-tmux-id"
   "File used for stable session identity when using `id-file' strategy.")
+
+(defun project-tmux--ensure-tmux ()
+  "Ensure tmux executable is available."
+  (unless (executable-find "tmux")
+    (user-error "`tmux' executable was not found in PATH")))
+
+(defun project-tmux--project-context ()
+  "Return project context plist with root and session base."
+  (let* ((project (project-current t))
+         (root (project-root project)))
+    (list :project project
+          :root root
+          :session-base (project-tmux--session-base-name project))))
+
+(defun project-tmux--current-view-index (session-base)
+  "Return current project-tmux view index for SESSION-BASE, defaulting to 1."
+  (if (and (derived-mode-p 'eat-mode)
+           (integerp project-tmux--view-index)
+           (stringp project-tmux--session-base)
+           (string= project-tmux--session-base session-base))
+      project-tmux--view-index
+    1))
 
 (defun project-tmux--path-session-base (project)
   "Return path-based tmux session base name for PROJECT."
@@ -196,6 +234,68 @@ SESSION-BASE itself counts as view 1."
       (when-let* ((proc (get-buffer-process buffer)))
         (set-process-query-on-exit-flag proc nil)))))
 
+(defun project-tmux--capture-pane-text (pane-id)
+  "Capture all available text from tmux PANE-ID."
+  (with-temp-buffer
+    (let ((status (process-file "tmux" nil t nil
+                                "capture-pane" "-p" "-J" "-S" "-"
+                                "-t" pane-id)))
+      (if (zerop status)
+          (buffer-string)
+        (user-error "Could not capture tmux pane %s: %s"
+                    pane-id (string-trim (buffer-string)))))))
+
+(defun project-tmux--current-pane-id (session-target)
+  "Return ID of active pane in current tmux window of SESSION-TARGET."
+  (with-temp-buffer
+    (let ((status (process-file "tmux" nil t nil
+                                "display-message"
+                                "-p"
+                                "-t" session-target
+                                "#{pane_id}")))
+      (unless (zerop status)
+        (user-error "Could not get current tmux pane for %s: %s"
+                    session-target (string-trim (buffer-string)))))
+    (let ((pane-id (string-trim (buffer-string))))
+      (if (string-empty-p pane-id)
+          (user-error "No active pane found for %s" session-target)
+        pane-id))))
+
+;;;###autoload
+(defun project-tmux-capture-pane ()
+  "Capture the current project-tmux pane into a `special-mode' buffer."
+  (interactive)
+  (require 'project)
+  (project-tmux--ensure-tmux)
+  (let* ((context (project-tmux--project-context))
+         (session-base (plist-get context :session-base))
+         (view-index (project-tmux--current-view-index session-base)))
+    (let* ((target (project-tmux--view-session-name session-base view-index))
+           (pane-id (project-tmux--current-pane-id target))
+           (text (project-tmux--capture-pane-text pane-id))
+           (base-name (project-prefixed-buffer-name "tmux-capture"))
+           (buffer-name (if (= view-index 1)
+                            base-name
+                          (format "%s<%d>" base-name view-index)))
+           (buffer (get-buffer-create buffer-name)))
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "Session: %s\nView: %d\nPane: %s\n\n"
+                          session-base view-index pane-id))
+          (insert text)
+          (unless (string-suffix-p "\n" text)
+            (insert "\n"))
+          (goto-char (point-min))
+          (special-mode)))
+      (pop-to-buffer buffer))))
+
+;;;###autoload
+(defun project-tmux-capture-window ()
+  "Backward-compatible alias for `project-tmux-capture-pane'."
+  (interactive)
+  (project-tmux-capture-pane))
+
 ;;;###autoload
 (defun project-tmux (&optional arg)
   "Open a project-local tmux view in an Eat buffer.
@@ -208,11 +308,10 @@ available view index."
   (unless (require 'eat nil t)
     (user-error "Package `eat' is not available"))
   (require 'project)
-  (unless (executable-find "tmux")
-    (user-error "`tmux' executable was not found in PATH"))
-  (let* ((project (project-current t))
-         (default-directory (project-root project))
-         (session-base (project-tmux--session-base-name project))
+  (project-tmux--ensure-tmux)
+  (let* ((context (project-tmux--project-context))
+         (default-directory (plist-get context :root))
+         (session-base (plist-get context :session-base))
          (view-index (cond
                       ((numberp arg)
                        (prefix-numeric-value arg))
@@ -227,6 +326,10 @@ available view index."
            (eat-buffer-name (project-prefixed-buffer-name "tmux"))
            (eat-arg (if arg view-index nil))
            (buffer (eat command eat-arg)))
+      (with-current-buffer buffer
+        (setq-local project-tmux--session-base session-base
+                    project-tmux--view-index view-index)
+        (project-tmux-mode 1))
       (project-tmux--disable-kill-query buffer)
       buffer)))
 
