@@ -181,6 +181,28 @@ When FORCE-TTY is non-nil, pass `-tt' to ssh."
       (when (zerop status)
         (split-string (buffer-string) "\n" t)))))
 
+(defun eat-tmux--resolve-remote-directory (remote directory)
+  "Return DIRECTORY for REMOTE as an absolute path when possible."
+  (cond
+   ((not (stringp directory))
+    directory)
+   ((not (string-prefix-p "~" directory))
+    directory)
+   ((and (not (string= directory "~"))
+         (not (string-prefix-p "~/" directory)))
+    directory)
+   (t
+    (let ((home (car (eat-tmux--ssh-command-output-lines
+                      remote
+                      "printf '%s\\n' \"$HOME\""))))
+      (if (and (stringp home) (string-prefix-p "/" home))
+          (if (or (string= directory "~")
+                  (string= directory "~/"))
+              home
+            (concat (file-name-as-directory home)
+                    (string-remove-prefix "~/" directory)))
+        directory)))))
+
 (defun eat-tmux--project-context ()
   "Return project context plist with root and session base."
   (let* ((project (project-current t))
@@ -361,6 +383,8 @@ SESSION-BASE itself counts as view 1."
          (q #'shell-quote-argument)
          (parts
           (list
+           (format "cd %s || exit 1"
+                   (funcall q directory))
            (format "tmux has-session -t %s 2>/dev/null || tmux new-session -Ad -s %s -c %s"
                    (funcall q session-base)
                    (funcall q session-base)
@@ -371,9 +395,10 @@ SESSION-BASE itself counts as view 1."
                      (funcall q session-base)
                      (funcall q target)
                      (funcall q directory)))
-           (format "if [ -n \"$TMUX\" ]; then tmux switch-client -t %s; else exec tmux attach-session -t %s; fi"
+           (format "if [ -n \"$TMUX\" ]; then tmux switch-client -t %s; else exec tmux attach-session -t %s -c %s; fi"
                    (funcall q target)
-                   (funcall q target)))))
+                   (funcall q target)
+                   (funcall q directory)))))
     (mapconcat #'identity (delq nil parts) "; ")))
 
 (defun eat-tmux--disable-kill-query (buffer)
@@ -509,15 +534,18 @@ available view index."
   (let* ((context (eat-tmux--project-context))
          (project-root (plist-get context :root))
          (remote (plist-get context :remote))
-         (buffer-name (let ((default-directory project-root))
+         (local-root (if remote project-root (expand-file-name project-root)))
+         (buffer-name (let ((default-directory local-root))
                         (project-prefixed-buffer-name "tmux")))
          (default-directory (if remote
                                 (expand-file-name "~")
-                              project-root))
+                              local-root))
          (session-base (plist-get context :session-base))
          (tmux-directory (if remote
-                             (plist-get remote :directory)
-                           project-root))
+                             (eat-tmux--resolve-remote-directory
+                              remote
+                              (plist-get remote :directory))
+                           local-root))
          (view-index (cond
                       ((numberp arg)
                        (prefix-numeric-value arg))
@@ -542,7 +570,7 @@ available view index."
         (setq-local eat-tmux--session-base session-base
                     eat-tmux--view-index view-index
                     eat-tmux--remote-context remote)
-        (setq-local default-directory project-root)
+        (setq-local default-directory local-root)
         (eat-tmux-mode 1))
       (eat-tmux--disable-kill-query buffer)
       buffer)))
