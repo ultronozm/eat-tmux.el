@@ -169,8 +169,14 @@ When FORCE-TTY is non-nil, pass `-tt' to ssh."
                               (funcall q remote-command))))
     (mapconcat #'identity parts " ")))
 
-(defun eat-tmux--ssh-command-output-lines (remote remote-command)
-  "Run REMOTE-COMMAND via ssh for REMOTE and return output lines or nil."
+(defun eat-tmux--shell-command (argv)
+  "Return a shell-safe command string from ARGV."
+  (mapconcat #'shell-quote-argument argv " "))
+
+(defun eat-tmux--ssh-command-output-string (remote remote-command &optional require-success)
+  "Run REMOTE-COMMAND via ssh for REMOTE and return raw output string.
+
+When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
   (with-temp-buffer
     (let* ((port (plist-get remote :port))
            (args (append (when (and (stringp port) (not (string-empty-p port)))
@@ -178,8 +184,20 @@ When FORCE-TTY is non-nil, pass `-tt' to ssh."
                          (list (eat-tmux--ssh-target remote)
                                remote-command)))
            (status (apply #'process-file "ssh" nil t nil args)))
-      (when (zerop status)
-        (split-string (buffer-string) "\n" t)))))
+      (if (zerop status)
+          (buffer-string)
+        (when require-success
+          (user-error "Remote command failed (%d): %s"
+                      status
+                      (string-trim (buffer-string))))))))
+
+(defun eat-tmux--ssh-command-output-lines (remote remote-command &optional require-success)
+  "Run REMOTE-COMMAND via ssh for REMOTE and return output lines or nil.
+
+When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
+  (when-let* ((output (eat-tmux--ssh-command-output-string
+                       remote remote-command require-success)))
+    (split-string output "\n" t)))
 
 (defun eat-tmux--resolve-remote-directory (remote directory)
   "Return DIRECTORY for REMOTE as an absolute path when possible."
@@ -349,8 +367,9 @@ fall back to path-based naming."
   (if remote
       (eat-tmux--ssh-command-output-lines
        remote
-       (format "tmux list-sessions -F %s 2>/dev/null"
-               (shell-quote-argument "#{session_name}")))
+       (format "%s 2>/dev/null"
+               (eat-tmux--shell-command
+                (list "tmux" "list-sessions" "-F" "#{session_name}"))))
     (condition-case nil
         (process-lines "tmux" "list-sessions" "-F" "#{session_name}")
       (error nil))))
@@ -411,62 +430,101 @@ SESSION-BASE itself counts as view 1."
       (when-let* ((proc (get-buffer-process buffer)))
         (set-process-query-on-exit-flag proc nil)))))
 
-(defun eat-tmux--capture-pane-text (pane-id)
-  "Capture all available text from tmux PANE-ID."
-  (with-temp-buffer
-    (let ((status (process-file "tmux" nil t nil
-                                "capture-pane" "-p" "-J" "-S" "-"
-                                "-t" pane-id)))
-      (if (zerop status)
-          (buffer-string)
-        (user-error "Could not capture tmux pane %s: %s"
-                    pane-id (string-trim (buffer-string)))))))
+(defun eat-tmux--capture-pane-text (pane-id &optional remote)
+  "Capture all available text from tmux PANE-ID.
 
-(defun eat-tmux--current-pane-id (session-target)
-  "Return ID of active pane in current tmux window of SESSION-TARGET."
-  (with-temp-buffer
-    (let ((status (process-file "tmux" nil t nil
-                                "display-message"
-                                "-p"
-                                "-t" session-target
-                                "#{pane_id}")))
-      (unless (zerop status)
-        (user-error "Could not get current tmux pane for %s: %s"
-                    session-target (string-trim (buffer-string)))))
-    (let ((pane-id (string-trim (buffer-string))))
-      (if (string-empty-p pane-id)
-          (user-error "No active pane found for %s" session-target)
-        pane-id))))
+When REMOTE is non-nil, run on the remote tmux server."
+  (if remote
+      (let ((output (eat-tmux--ssh-command-output-string
+                     remote
+                     (eat-tmux--shell-command
+                      (list "tmux" "capture-pane" "-p" "-J" "-S" "-"
+                            "-t" pane-id))
+                     t)))
+        (or output ""))
+    (with-temp-buffer
+      (let ((status (process-file "tmux" nil t nil
+                                  "capture-pane" "-p" "-J" "-S" "-"
+                                  "-t" pane-id)))
+        (if (zerop status)
+            (buffer-string)
+          (user-error "Could not capture tmux pane %s: %s"
+                      pane-id (string-trim (buffer-string))))))))
+
+(defun eat-tmux--current-pane-id (session-target &optional remote)
+  "Return ID of active pane in current tmux window of SESSION-TARGET.
+
+When REMOTE is non-nil, run on the remote tmux server."
+  (let* ((output
+          (if remote
+              (or (eat-tmux--ssh-command-output-string
+                   remote
+                   (eat-tmux--shell-command
+                    (list "tmux" "display-message" "-p"
+                          "-t" session-target "#{pane_id}"))
+                   t)
+                  "")
+            (with-temp-buffer
+              (let ((status (process-file "tmux" nil t nil
+                                          "display-message"
+                                          "-p"
+                                          "-t" session-target
+                                          "#{pane_id}")))
+                (unless (zerop status)
+                  (user-error "Could not get current tmux pane for %s: %s"
+                              session-target (string-trim (buffer-string)))))
+              (buffer-string))))
+         (pane-id (string-trim output)))
+    (if (string-empty-p pane-id)
+        (user-error "No active pane found for %s" session-target)
+      pane-id)))
 
 (defun eat-tmux--capture-context-from-current-buffer ()
   "Return live tmux context from current Eat buffer, or nil."
   (when (derived-mode-p 'eat-mode)
-    (when-let* ((proc (get-buffer-process (current-buffer)))
-                ((process-live-p proc))
-                (client (eat-tmux--tmux-client-for-process proc)))
-      (let* ((session-name (plist-get client :session))
-             (pane-id (plist-get client :pane))
-             (parts (eat-tmux--session-name-components session-name))
-             (session-base (nth 0 parts))
-             (view-index (nth 1 parts)))
-        (unless (and (stringp pane-id) (not (string-empty-p pane-id)))
-          (setq pane-id
-                (eat-tmux--current-pane-id
-                 (eat-tmux--view-session-name session-base view-index))))
-        (list :session-base session-base
-              :view-index view-index
-              :pane-id pane-id)))))
+    (if eat-tmux--remote-context
+        (when (and (stringp eat-tmux--session-base)
+                   (integerp eat-tmux--view-index))
+          (let* ((session-base eat-tmux--session-base)
+                 (view-index eat-tmux--view-index)
+                 (target (eat-tmux--view-session-name session-base view-index))
+                 (pane-id (eat-tmux--current-pane-id target
+                                                     eat-tmux--remote-context)))
+            (list :session-base session-base
+                  :view-index view-index
+                  :pane-id pane-id
+                  :remote eat-tmux--remote-context)))
+      (when-let* ((proc (get-buffer-process (current-buffer)))
+                  ((process-live-p proc))
+                  (client (eat-tmux--tmux-client-for-process proc)))
+        (let* ((session-name (plist-get client :session))
+               (pane-id (plist-get client :pane))
+               (parts (eat-tmux--session-name-components session-name))
+               (session-base (nth 0 parts))
+               (view-index (nth 1 parts)))
+          (unless (and (stringp pane-id) (not (string-empty-p pane-id)))
+            (setq pane-id
+                  (eat-tmux--current-pane-id
+                   (eat-tmux--view-session-name session-base view-index))))
+          (list :session-base session-base
+                :view-index view-index
+                :pane-id pane-id
+                :remote nil))))))
 
-(defun eat-tmux--fallback-capture-context ()
-  "Return capture context based on project/session metadata."
+(defun eat-tmux--fallback-capture-context (&optional remote)
+  "Return capture context based on project/session metadata.
+
+When REMOTE is non-nil, run capture queries against remote tmux."
   (let* ((context (eat-tmux--project-context))
+         (effective-remote (or remote (plist-get context :remote)))
          (session-base (plist-get context :session-base))
          (view-index (eat-tmux--current-view-index session-base))
          (target (eat-tmux--view-session-name session-base view-index))
-         (pane-id (eat-tmux--current-pane-id target)))
+         (pane-id (eat-tmux--current-pane-id target effective-remote)))
     (list :session-base session-base
           :view-index view-index
-          :pane-id pane-id)))
+          :pane-id pane-id
+          :remote effective-remote)))
 
 (defun eat-tmux--capture-buffer-name (session-base view-index)
   "Return capture buffer name for SESSION-BASE and VIEW-INDEX."
@@ -487,18 +545,21 @@ live pane attached to that buffer's tmux client.
 
 Otherwise, fall back to current eat-tmux session/view metadata."
   (interactive)
-  (when (and (derived-mode-p 'eat-mode) eat-tmux--remote-context)
-    (user-error "Remote capture is not implemented yet"))
-  (eat-tmux--ensure-tmux)
   (let* ((capture-context
           (or (eat-tmux--capture-context-from-current-buffer)
               (progn
                 (require 'project)
-                (eat-tmux--fallback-capture-context))))
+                (eat-tmux--fallback-capture-context
+                 (and (derived-mode-p 'eat-mode)
+                      eat-tmux--remote-context)))))
          (session-base (plist-get capture-context :session-base))
          (view-index (plist-get capture-context :view-index))
          (pane-id (plist-get capture-context :pane-id))
-         (text (eat-tmux--capture-pane-text pane-id))
+         (remote (plist-get capture-context :remote))
+         (_ (if remote
+                (eat-tmux--ensure-ssh)
+              (eat-tmux--ensure-tmux)))
+         (text (eat-tmux--capture-pane-text pane-id remote))
          (buffer-name (eat-tmux--capture-buffer-name session-base view-index))
          (buffer (get-buffer-create buffer-name)))
     (with-current-buffer buffer
