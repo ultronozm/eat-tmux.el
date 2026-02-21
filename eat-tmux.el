@@ -169,6 +169,13 @@ The value can be one of:
   :type 'boolean
   :group 'eat-tmux)
 
+(defcustom eat-tmux-manager-path-column-width 24
+  "Width of the Path column in `eat-tmux-manager'.
+
+Path display is tail-truncated to keep the most specific suffix visible."
+  :type 'integer
+  :group 'eat-tmux)
+
 (defconst eat-tmux-manager--buffer-name "*eat-tmux-manager*"
   "Name of the `eat-tmux-manager' buffer.")
 
@@ -1109,6 +1116,24 @@ available view index."
       (mapconcat #'eat-tmux-manager--window-label windows " ")
     ""))
 
+(defun eat-tmux-manager--display-path (path)
+  "Return manager display string for PATH.
+
+Long paths are truncated from the left so the rightmost, most
+informative path suffix remains visible."
+  (let* ((raw (or path ""))
+         (short (abbreviate-file-name raw))
+         (width (max 4 eat-tmux-manager-path-column-width))
+         (len (length short)))
+    (if (<= len width)
+        short
+      (let* ((tail (substring short
+                              (max 0 (- len (1- width)))))
+             (slash (string-match "/" tail)))
+        (when (and slash (> slash 0))
+          (setq tail (substring tail slash)))
+        (concat "…" tail)))))
+
 (defun eat-tmux--session-window-table (&optional remote)
   "Return hash table of session metadata for local tmux or REMOTE.
 
@@ -1179,6 +1204,7 @@ Each value is a plist with keys:
              (display-path (if (and remote (not (string-empty-p tmux-path)))
                                (eat-tmux--remote-path->tramp remote tmux-path)
                              tmux-path))
+             (display-path-short (eat-tmux-manager--display-path display-path))
              (id (if remote
                      (format "remote:%s:%s" remote-key session)
                    (format "local:%s" session))))
@@ -1187,6 +1213,7 @@ Each value is a plist with keys:
                     :session session
                     :windows windows
                     :windows-text windows-text
+                    :path-display display-path-short
                     :path display-path
                     :tmux-path tmux-path
                     :remote remote)
@@ -1208,7 +1235,9 @@ Each value is a plist with keys:
   (vector
    (or (plist-get record :source) "")
    (or (plist-get record :session) "")
-   (or (plist-get record :path) "")
+   (or (plist-get record :path-display)
+       (plist-get record :path)
+       "")
    (or (plist-get record :windows-text) "")))
 
 (defun eat-tmux-manager--current-record ()
@@ -1290,7 +1319,13 @@ Each value is a plist with keys:
 
 (define-derived-mode eat-tmux-manager-mode tabulated-list-mode "Eat-Tmux-Manager"
   "Major mode for browsing and jumping between tmux sessions."
-  (setq tabulated-list-format eat-tmux-manager--columns)
+  (setq tabulated-list-format
+        (vconcat
+         (list
+          '("Src" 18 t)
+          '("Session" 30 t)
+          (list "Path" eat-tmux-manager-path-column-width t)
+          '("Windows" 0 t))))
   (setq tabulated-list-padding 2)
   (setq tabulated-list-sort-key '("Src" . nil))
   (tabulated-list-init-header)
