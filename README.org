@@ -1,0 +1,57 @@
+#+title: eat-tmux
+
+Open tmux sessions/views inside [[https://codeberg.org/akib/emacs-eat][Eat]] buffers, scoped to Emacs projects.
+
+* Commands
+
+- =M-x eat-tmux-project=: open or attach to the project tmux view.
+  - no prefix: view 1
+  - numeric prefix =N=: view =N=
+  - non-numeric prefix (=C-u=): next free view index
+- =M-x eat-tmux-open=: open or create a named tmux session for any directory.
+- =M-x eat-tmux-capture-pane=: capture the current tmux pane output to a =special-mode= buffer.
+- =M-x eat-tmux-manager=: browse tmux sessions in a tabulated manager UI.
+
+* Requirements
+
+- Emacs with the [[https://codeberg.org/akib/emacs-eat][eat]] package available
+- =tmux= in =PATH=
+- =ssh= in =PATH= for remote (=TRAMP=) project usage
+
+* Optional Integration: tmux-agent-indicator
+
+=eat-tmux-manager= intentionally integrates with
+[[https://github.com/accessd/tmux-agent-indicator][tmux-agent-indicator]]
+by default when it finds environment variables like:
+
+- =TMUX_AGENT_PANE_%1_STATE=running=
+- =TMUX_AGENT_PANE_%2_STATE=needs-input=
+
+This integration is optional. If those variables are absent, manager
+window state simply falls back to =idle=.
+
+* Generic Pane-State Integration
+
+The manager's pane-state integration is configurable:
+
+- =eat-tmux-manager-pane-state-provider=
+- =eat-tmux-manager-pane-state-env-regexp=
+- =eat-tmux-manager-pane-state-normalizer=
+- =eat-tmux-manager-pane-state-alist=
+
+Disable pane-state integration:
+
+#+begin_src emacs-lisp
+(setq eat-tmux-manager-pane-state-provider nil)
+#+end_src
+
+Use a custom provider:
+
+#+begin_src emacs-lisp
+(setq eat-tmux-manager-pane-state-provider
+      (lambda (remote)
+        ;; Return hash table mapping pane IDs (%1, %2, ...) to raw states.
+        (let ((table (make-hash-table :test #'equal)))
+          ;; (puthash "%1" "running" table)
+          table)))
+#+end_src

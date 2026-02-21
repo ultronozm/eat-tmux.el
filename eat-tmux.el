@@ -24,6 +24,10 @@
 ;; `eat-tmux-open' opens or creates a tmux session for any directory.
 ;; `eat-tmux-manager' provides a tabulated session browser/jump UI.
 ;;
+;; `eat-tmux-manager' can optionally display pane/window activity from
+;; tmux environment metadata (for example variables produced by
+;; tmux-agent-indicator: <https://github.com/accessd/tmux-agent-indicator>).
+;;
 ;; `eat-tmux-project' prefix argument behavior:
 ;; - no prefix: attach or create view 1
 ;; - numeric prefix N: attach or create view N
@@ -179,6 +183,64 @@ Path display is tail-truncated to keep the most specific suffix visible."
   :type 'integer
   :group 'eat-tmux)
 
+(defcustom eat-tmux-manager-pane-state-provider
+  #'eat-tmux-manager-pane-state-provider-tmux-environment
+  "Function used to read pane state metadata for `eat-tmux-manager'.
+
+The function is called with one argument REMOTE (a remote context
+plist or nil for local tmux) and should return either:
+
+- a hash table mapping pane IDs (for example \"%1\") to raw state
+  strings, or
+- nil to indicate no pane state metadata is available.
+
+The default provider reads `tmux show-environment -g' lines and parses
+variables like `TMUX_AGENT_PANE_%N_STATE=...'.  This intentionally
+integrates with tmux-agent-indicator while remaining configurable."
+  :type '(choice
+          (const :tag "Disabled" nil)
+          (function :tag "Provider function"))
+  :group 'eat-tmux)
+
+(defcustom eat-tmux-manager-pane-state-env-regexp
+  "\\`TMUX_AGENT_PANE_\\(%[0-9]+\\)_STATE=\\(.+\\)\\'"
+  "Regexp used by default pane state provider.
+
+The regexp must capture:
+- group 1: pane ID (for example \"%1\")
+- group 2: raw state value."
+  :type 'regexp
+  :group 'eat-tmux)
+
+(defcustom eat-tmux-manager-pane-state-normalizer
+  #'eat-tmux-manager-normalize-pane-state
+  "Function used to normalize raw pane state values.
+
+The function is called with RAW-STATE (a string or nil) and should
+return one of:
+- \"needs-input\"
+- \"running\"
+- \"idle\"
+
+Any other return value is treated as \"idle\"."
+  :type '(function :tag "State normalizer")
+  :group 'eat-tmux)
+
+(defcustom eat-tmux-manager-pane-state-alist
+  '(("running" . "running")
+    ("busy" . "running")
+    ("needs-input" . "needs-input")
+    ("done" . "needs-input"))
+  "Raw-to-normalized pane state mapping used by default normalizer.
+
+Keys are compared case-insensitively after trimming whitespace."
+  :type '(alist :key-type string
+                :value-type (choice
+                             (const :tag "Needs Input" "needs-input")
+                             (const :tag "Running" "running")
+                             (const :tag "Idle" "idle")))
+  :group 'eat-tmux)
+
 (defconst eat-tmux-manager--buffer-name "*eat-tmux-manager*"
   "Name of the `eat-tmux-manager' buffer.")
 
@@ -199,7 +261,7 @@ Path display is tail-truncated to keep the most specific suffix visible."
 
 (defface eat-tmux-manager-window-running-face
   '((t :inherit success))
-  "Face for manager windows with active agent activity."
+  "Face for manager windows with active pane activity."
   :group 'eat-tmux)
 
 (defface eat-tmux-manager-window-idle-face
@@ -1128,20 +1190,73 @@ available view index."
                   (push remote remotes))))))))
     (nreverse remotes)))
 
-(defun eat-tmux-manager--parse-agent-indicator-env-lines (lines)
-  "Parse tmux agent-indicator LINES and return pane state map plist."
-  (let ((states (make-hash-table :test #'equal)))
-    (dolist (line (or lines '()))
-      (when (string-match "\\`TMUX_AGENT_PANE_\\(%[0-9]+\\)_STATE=\\(.+\\)\\'" line)
-        (puthash (match-string 1 line) (match-string 2 line) states)))
-    (list :state states)))
+(defun eat-tmux-manager--parse-pane-state-env-lines (lines)
+  "Parse pane state metadata from tmux environment LINES.
 
-(defun eat-tmux-manager--normalize-indicator-state (raw-state)
-  "Return normalized manager state for indicator RAW-STATE."
-  (pcase (string-trim (or raw-state ""))
-    ((or "running" "busy") "running")
-    ((or "needs-input" "done") "needs-input")
-    (_ "idle")))
+Returns a hash table mapping pane IDs to raw state strings according to
+`eat-tmux-manager-pane-state-env-regexp'."
+  (let ((states (make-hash-table :test #'equal)))
+    (condition-case err
+        (dolist (line (or lines '()))
+          (when (string-match eat-tmux-manager-pane-state-env-regexp line)
+            (puthash (match-string 1 line) (match-string 2 line) states)))
+      (invalid-regexp
+       (message "eat-tmux: invalid pane state regexp %S (%s)"
+                eat-tmux-manager-pane-state-env-regexp
+                (error-message-string err))))
+    states))
+
+(defun eat-tmux-manager-pane-state-provider-tmux-environment (remote)
+  "Default pane state provider for `eat-tmux-manager'.
+
+Read `tmux show-environment -g' for REMOTE and parse it using
+`eat-tmux-manager-pane-state-env-regexp'.  This works with
+tmux-agent-indicator-style variables by default."
+  (eat-tmux-manager--parse-pane-state-env-lines
+   (eat-tmux--tmux-command-lines remote "show-environment" "-g")))
+
+(defun eat-tmux-manager-normalize-pane-state (raw-state)
+  "Normalize RAW-STATE to a manager window state string.
+
+Uses `eat-tmux-manager-pane-state-alist'."
+  (let* ((key (downcase (string-trim (or raw-state ""))))
+         (mapped (cdr (assoc-string key eat-tmux-manager-pane-state-alist t))))
+    (or mapped "idle")))
+
+(defun eat-tmux-manager--normalized-pane-state (raw-state)
+  "Return normalized pane state for RAW-STATE using custom normalizer."
+  (let ((state (if (functionp eat-tmux-manager-pane-state-normalizer)
+                   (funcall eat-tmux-manager-pane-state-normalizer raw-state)
+                 "idle")))
+    (if (member state '("needs-input" "running" "idle"))
+        state
+      "idle")))
+
+(defun eat-tmux-manager--pane-state-map (&optional remote)
+  "Return pane state map hash table for REMOTE, or an empty map."
+  (let ((empty (make-hash-table :test #'equal)))
+    (if (not (functionp eat-tmux-manager-pane-state-provider))
+        empty
+      (condition-case err
+          (let ((result (funcall eat-tmux-manager-pane-state-provider remote)))
+            (cond
+             ((hash-table-p result) result)
+             ((null result) empty)
+             (t
+              (message "eat-tmux: pane state provider returned %S, expected hash table or nil"
+                       (type-of result))
+              empty)))
+        (error
+         (message "eat-tmux: pane state provider failed: %s"
+                  (error-message-string err))
+         empty)))))
+
+;; Backward-compatible aliases for older internal names.
+(defalias 'eat-tmux-manager--parse-agent-indicator-env-lines
+  #'eat-tmux-manager--parse-pane-state-env-lines)
+
+(defalias 'eat-tmux-manager--normalize-indicator-state
+  #'eat-tmux-manager--normalized-pane-state)
 
 (defun eat-tmux-manager--state-rank (state)
   "Return manager sort rank for STATE."
@@ -1218,10 +1333,7 @@ informative path suffix remains visible."
 Each value is a plist with keys:
 - `:path': session working path (active pane preferred)
 - `:windows': sorted list of window plists with `:index', `:name', `:state'."
-  (let* ((env (eat-tmux-manager--parse-agent-indicator-env-lines
-               (eat-tmux--tmux-command-lines remote
-                                             "show-environment" "-g")))
-         (state-map (plist-get env :state))
+  (let* ((state-map (eat-tmux-manager--pane-state-map remote))
          (table (make-hash-table :test #'equal)))
     (dolist (line (eat-tmux--tmux-command-lines
                    remote
@@ -1241,7 +1353,7 @@ Each value is a plist with keys:
             (let* ((windows (plist-get entry :windows))
                    (window (or (gethash window-index windows)
                                (list :index window-index :name "" :state "idle")))
-                   (pane-state (eat-tmux-manager--normalize-indicator-state
+                   (pane-state (eat-tmux-manager--normalized-pane-state
                                 (and (stringp pane-id)
                                      (gethash pane-id state-map))))
                    (window-state (eat-tmux-manager--merge-state
