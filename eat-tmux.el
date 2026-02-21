@@ -47,11 +47,19 @@
 (declare-function project-current "project" (&optional maybe-prompt dir))
 (declare-function project-prefixed-buffer-name "project" (mode))
 (declare-function project-root "project" (project))
+(declare-function tramp-dissect-file-name "tramp" (name &optional nodefault))
+(declare-function tramp-file-name-host "tramp" (vec))
+(declare-function tramp-file-name-localname "tramp" (vec))
+(declare-function tramp-file-name-method "tramp" (vec))
+(declare-function tramp-file-name-port "tramp" (vec))
+(declare-function tramp-file-name-user "tramp" (vec))
 
 (defvar eat-buffer-name)
 
 (defvar-local eat-tmux--session-base nil)
 (defvar-local eat-tmux--view-index nil)
+(defvar-local eat-tmux--remote-context nil
+  "Remote connection plist for tmux commands in current Eat buffer.")
 (defvar eat-tmux-mode-map
   (let ((map (make-sparse-keymap)))
     (keymap-set map "C-c C-v" #'eat-tmux-capture-pane)
@@ -86,6 +94,16 @@ The value can be one of:
           (function :tag "Custom function"))
   :group 'eat-tmux)
 
+(defcustom eat-tmux-remote-execution 'ssh
+  "How `eat-tmux-project' handles remote project roots.
+
+- `ssh': run tmux on the remote host via `ssh -tt'.
+- `error': signal an error for remote projects."
+  :type '(choice
+          (const :tag "Run remotely over ssh" ssh)
+          (const :tag "Error on remote projects" error))
+  :group 'eat-tmux)
+
 (defconst eat-tmux--id-file-name ".eat-tmux-id"
   "File used for stable session identity when using `id-file' strategy.")
 
@@ -94,13 +112,83 @@ The value can be one of:
   (unless (executable-find "tmux")
     (user-error "`tmux' executable was not found in PATH")))
 
+(defun eat-tmux--ensure-ssh ()
+  "Ensure ssh executable is available."
+  (unless (executable-find "ssh")
+    (user-error "`ssh' executable was not found in PATH")))
+
+(defun eat-tmux--remote-context (directory)
+  "Return remote context plist for DIRECTORY, or nil when local."
+  (when (file-remote-p directory)
+    (pcase eat-tmux-remote-execution
+      ('error
+       (user-error "Remote projects are disabled (`eat-tmux-remote-execution' is `error')"))
+      ('ssh
+       (unless (require 'tramp nil t)
+         (user-error "TRAMP is required for remote project support"))
+       (let* ((vec (tramp-dissect-file-name directory))
+              (method (tramp-file-name-method vec))
+              (user (tramp-file-name-user vec))
+              (host (tramp-file-name-host vec))
+              (port (tramp-file-name-port vec))
+              (remote-dir (tramp-file-name-localname vec)))
+         (unless (member method '("ssh" "sshx" "scp" "scpx"))
+           (user-error "Remote method %S is unsupported; use ssh/scp TRAMP methods"
+                       method))
+         (list :method method
+               :user user
+               :host host
+               :port port
+               :directory remote-dir)))
+      (_
+       (user-error "Invalid `eat-tmux-remote-execution': %S"
+                   eat-tmux-remote-execution)))))
+
+(defun eat-tmux--ssh-target (remote)
+  "Return user@host target string for REMOTE plist."
+  (let ((user (plist-get remote :user))
+        (host (plist-get remote :host)))
+    (if (and (stringp user) (not (string-empty-p user)))
+        (format "%s@%s" user host)
+      host)))
+
+(defun eat-tmux--ssh-shell-command (remote remote-command &optional force-tty)
+  "Return local shell command to run REMOTE-COMMAND over ssh.
+
+When FORCE-TTY is non-nil, pass `-tt' to ssh."
+  (let* ((q #'shell-quote-argument)
+         (target (eat-tmux--ssh-target remote))
+         (port (plist-get remote :port))
+         (parts (list "exec" "ssh")))
+    (when force-tty
+      (setq parts (append parts (list "-tt"))))
+    (when (and (stringp port) (not (string-empty-p port)))
+      (setq parts (append parts (list "-p" (funcall q port)))))
+    (setq parts (append parts
+                        (list (funcall q target)
+                              (funcall q remote-command))))
+    (mapconcat #'identity parts " ")))
+
+(defun eat-tmux--ssh-command-output-lines (remote remote-command)
+  "Run REMOTE-COMMAND via ssh for REMOTE and return output lines or nil."
+  (with-temp-buffer
+    (let* ((port (plist-get remote :port))
+           (args (append (when (and (stringp port) (not (string-empty-p port)))
+                           (list "-p" port))
+                         (list (eat-tmux--ssh-target remote)
+                               remote-command)))
+           (status (apply #'process-file "ssh" nil t nil args)))
+      (when (zerop status)
+        (split-string (buffer-string) "\n" t)))))
+
 (defun eat-tmux--project-context ()
   "Return project context plist with root and session base."
   (let* ((project (project-current t))
          (root (project-root project)))
     (list :project project
           :root root
-          :session-base (eat-tmux--session-base-name project))))
+          :session-base (eat-tmux--session-base-name project)
+          :remote (eat-tmux--remote-context root))))
 
 (defun eat-tmux--current-view-index (session-base)
   "Return current eat-tmux view index for SESSION-BASE, defaulting to 1."
@@ -234,22 +322,31 @@ fall back to path-based naming."
       (user-error "Tmux session names for eat-tmux cannot contain ':' (got %S)" name))
     name))
 
+(defun eat-tmux--list-sessions (&optional remote)
+  "Return tmux session names locally or on REMOTE."
+  (if remote
+      (eat-tmux--ssh-command-output-lines
+       remote
+       (format "tmux list-sessions -F %s 2>/dev/null"
+               (shell-quote-argument "#{session_name}")))
+    (condition-case nil
+        (process-lines "tmux" "list-sessions" "-F" "#{session_name}")
+      (error nil))))
+
 (defun eat-tmux--view-session-name (session-base view-index)
   "Return tmux session name for SESSION-BASE and VIEW-INDEX."
   (if (= view-index 1)
       session-base
     (format "%s--view%d" session-base view-index)))
 
-(defun eat-tmux--next-view-index (session-base)
+(defun eat-tmux--next-view-index (session-base &optional remote)
   "Return the next free view index for SESSION-BASE.
 
 SESSION-BASE itself counts as view 1."
   (let ((re (format "\\`%s\\(?:--view\\|:view\\)\\([0-9]+\\)\\'"
                     (regexp-quote session-base)))
         (max-view 1))
-    (dolist (name (condition-case nil
-                      (process-lines "tmux" "list-sessions" "-F" "#{session_name}")
-                    (error nil)))
+    (dolist (name (eat-tmux--list-sessions remote))
       (cond
        ((string= name session-base)
         (setq max-view (max max-view 1)))
@@ -365,6 +462,8 @@ live pane attached to that buffer's tmux client.
 
 Otherwise, fall back to current eat-tmux session/view metadata."
   (interactive)
+  (when (and (derived-mode-p 'eat-mode) eat-tmux--remote-context)
+    (user-error "Remote capture is not implemented yet"))
   (eat-tmux--ensure-tmux)
   (let* ((capture-context
           (or (eat-tmux--capture-context-from-current-buffer)
@@ -407,27 +506,43 @@ available view index."
   (unless (require 'eat nil t)
     (user-error "Package `eat' is not available"))
   (require 'project)
-  (eat-tmux--ensure-tmux)
   (let* ((context (eat-tmux--project-context))
-         (default-directory (plist-get context :root))
+         (project-root (plist-get context :root))
+         (remote (plist-get context :remote))
+         (buffer-name (let ((default-directory project-root))
+                        (project-prefixed-buffer-name "tmux")))
+         (default-directory (if remote
+                                (expand-file-name "~")
+                              project-root))
          (session-base (plist-get context :session-base))
+         (tmux-directory (if remote
+                             (plist-get remote :directory)
+                           project-root))
          (view-index (cond
                       ((numberp arg)
                        (prefix-numeric-value arg))
                       (arg
-                       (eat-tmux--next-view-index session-base))
+                       (eat-tmux--next-view-index session-base remote))
                       (t 1))))
+    (if remote
+        (eat-tmux--ensure-ssh)
+      (eat-tmux--ensure-tmux))
     (when (< view-index 1)
       (user-error "View index must be >= 1"))
-    (let* ((command (eat-tmux--command session-base
-                                       view-index
-                                       default-directory))
-           (eat-buffer-name (project-prefixed-buffer-name "tmux"))
+    (let* ((tmux-command (eat-tmux--command session-base
+                                            view-index
+                                            tmux-directory))
+           (command (if remote
+                        (eat-tmux--ssh-shell-command remote tmux-command t)
+                      tmux-command))
+           (eat-buffer-name buffer-name)
            (eat-arg (if arg view-index nil))
            (buffer (eat command eat-arg)))
       (with-current-buffer buffer
         (setq-local eat-tmux--session-base session-base
-                    eat-tmux--view-index view-index)
+                    eat-tmux--view-index view-index
+                    eat-tmux--remote-context remote)
+        (setq-local default-directory project-root)
         (eat-tmux-mode 1))
       (eat-tmux--disable-kill-query buffer)
       buffer)))
