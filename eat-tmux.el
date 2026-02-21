@@ -299,6 +299,49 @@ When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
                        remote remote-command require-success)))
     (split-string output "\n" t)))
 
+(defun eat-tmux--remote-tramp-default-directory (remote)
+  "Return a TRAMP `default-directory' for REMOTE."
+  (let* ((dir (or (plist-get remote :directory) "~"))
+         (raw (if (and (stringp dir) (not (string-empty-p dir)))
+                  dir
+                "~")))
+    (file-name-as-directory
+     (eat-tmux--remote-path->tramp remote raw))))
+
+(defun eat-tmux--tramp-command-output-string (remote remote-command &optional require-success)
+  "Run REMOTE-COMMAND for REMOTE via TRAMP and return raw output string.
+
+When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
+  (with-temp-buffer
+    (let ((default-directory (eat-tmux--remote-tramp-default-directory remote)))
+      (condition-case err
+          (let ((status (process-file "sh" nil t nil "-lc" remote-command)))
+            (if (zerop status)
+                (buffer-string)
+              (when require-success
+                (user-error "Remote command failed (%d): %s"
+                            status
+                            (string-trim (buffer-string))))))
+        (file-error
+         (when require-success
+           (user-error "Remote command failed: %s"
+                       (error-message-string err))))))))
+
+(defun eat-tmux--remote-command-output-string (remote remote-command &optional require-success)
+  "Run REMOTE-COMMAND for REMOTE via ssh, falling back to TRAMP.
+
+When REQUIRE-SUCCESS is non-nil, signal a user error if both transports fail."
+  (or (eat-tmux--ssh-command-output-string remote remote-command)
+      (eat-tmux--tramp-command-output-string remote remote-command require-success)))
+
+(defun eat-tmux--remote-command-output-lines (remote remote-command &optional require-success)
+  "Run REMOTE-COMMAND for REMOTE and return output lines, or nil.
+
+When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
+  (when-let* ((output (eat-tmux--remote-command-output-string
+                       remote remote-command require-success)))
+    (split-string output "\n" t)))
+
 (defun eat-tmux--resolve-remote-directory (remote directory)
   "Return DIRECTORY for REMOTE as an absolute path when possible."
   (cond
@@ -308,9 +351,9 @@ When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
     directory)
    ((and (not (string= directory "~"))
          (not (string-prefix-p "~/" directory)))
-    directory)
+   directory)
    (t
-    (let ((home (car (eat-tmux--ssh-command-output-lines
+    (let ((home (car (eat-tmux--remote-command-output-lines
                       remote
                       "printf '%s\\n' \"$HOME\""))))
       (if (and (stringp home) (string-prefix-p "/" home))
@@ -403,9 +446,31 @@ When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
 
 (defun eat-tmux--path-session-base (project)
   "Return path-based tmux session base name for PROJECT."
-  (let* ((root (directory-file-name (file-truename (project-root project))))
+  (let* ((project-root (project-root project))
+         ;; Avoid `file-truename' on TRAMP roots, which can block on
+         ;; remote connection setup when we only need a stable identifier.
+         (remote-vec (and (file-remote-p project-root)
+                          (require 'tramp nil t)
+                          (tramp-dissect-file-name project-root)))
+         (root (cond
+                (remote-vec
+                 (directory-file-name
+                  (or (tramp-file-name-localname remote-vec)
+                      project-root)))
+                ((file-remote-p project-root)
+                 (directory-file-name project-root))
+                (t
+                 (directory-file-name (file-truename project-root)))))
+         (hash-input (if remote-vec
+                         (format "%s:%s:%s:%s:%s"
+                                 (or (tramp-file-name-method remote-vec) "")
+                                 (or (tramp-file-name-user remote-vec) "")
+                                 (or (tramp-file-name-host remote-vec) "")
+                                 (or (tramp-file-name-port remote-vec) "")
+                                 root)
+                       root))
          (base (file-name-nondirectory root))
-         (hash (substring (secure-hash 'sha1 root) 0 8)))
+         (hash (substring (secure-hash 'sha1 hash-input) 0 8)))
     (format "%s-%s" base hash)))
 
 (defun eat-tmux--read-id-file (file)
@@ -672,7 +737,7 @@ confused with tmux view indices."
 (defun eat-tmux--tmux-command-lines (remote &rest args)
   "Run tmux ARGS locally or on REMOTE and return output lines, or nil."
   (if remote
-      (eat-tmux--ssh-command-output-lines
+      (eat-tmux--remote-command-output-lines
        remote
        (eat-tmux--shell-command (cons "tmux" args)))
     (condition-case nil
@@ -754,9 +819,10 @@ derived view (`--viewN' or `:viewN')."
 (defun eat-tmux--tmux-directory (directory remote)
   "Return tmux-side working directory from DIRECTORY and REMOTE."
   (if remote
-      (if (file-remote-p directory)
-          (plist-get (eat-tmux--remote-context directory) :directory)
-        (eat-tmux--resolve-remote-directory remote directory))
+      (let ((remote-directory (if (file-remote-p directory)
+                                  (plist-get (eat-tmux--remote-context directory) :directory)
+                                directory)))
+        (eat-tmux--resolve-remote-directory remote remote-directory))
     (expand-file-name directory)))
 
 (defun eat-tmux--open-session (directory session-name &optional remote)
@@ -799,6 +865,14 @@ otherwise create a fresh buffer and attach."
                                                           session-name))
              (base-buffer-name (plist-get buffer-info :base))
              (buffer-name (plist-get buffer-info :name))
+             ;; Use a local default-directory for remote contexts so
+             ;; eat's make-process does not go through TRAMP (which
+             ;; would create a pipe instead of a real PTY, causing
+             ;; tmux to fail with "not a terminal").  The SSH wrapper
+             ;; with -tt handles PTY allocation on the remote side.
+             (launch-directory (if remote-context
+                                   (expand-file-name "~")
+                                 default-directory))
              (tmux-command (eat-tmux--command session-base
                                               session-name
                                               view-index
@@ -809,7 +883,8 @@ otherwise create a fresh buffer and attach."
                         tmux-command))
              (eat-buffer-name buffer-name)
              (eat-arg nil)
-             (buffer (eat command eat-arg)))
+             (buffer (let ((default-directory launch-directory))
+                       (eat command eat-arg))))
         (with-current-buffer buffer
           (setq-local eat-tmux--session-base session-base
                       eat-tmux--view-index view-index
@@ -852,7 +927,7 @@ fresh buffer and attach.  If SESSION-NAME does not exist yet, it is created."
 
 When REMOTE is non-nil, run on the remote tmux server."
   (if remote
-      (let ((output (eat-tmux--ssh-command-output-string
+      (let ((output (eat-tmux--remote-command-output-string
                      remote
                      (eat-tmux--shell-command
                       (list "tmux" "capture-pane" "-p" "-J" "-S" "-"
@@ -874,7 +949,7 @@ When REMOTE is non-nil, run on the remote tmux server."
 When REMOTE is non-nil, run on the remote tmux server."
   (let* ((output
           (if remote
-              (or (eat-tmux--ssh-command-output-string
+              (or (eat-tmux--remote-command-output-string
                    remote
                    (eat-tmux--shell-command
                     (list "tmux" "display-message" "-p"
@@ -1310,10 +1385,11 @@ Each value is a plist with keys:
 (defvar eat-tmux-manager-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'eat-tmux-manager-refresh)
+    (define-key map (kbd "o") #'eat-tmux-manager-visit)
     (define-key map (kbd "v") #'eat-tmux-manager-visit)
     (define-key map (kbd "RET") #'eat-tmux-manager-visit)
-    (define-key map (kbd "d") #'eat-tmux-manager-open-directory)
-    (define-key map (kbd "n") #'eat-tmux-manager-new)
+    (define-key map (kbd "j") #'eat-tmux-manager-open-directory)
+    (define-key map (kbd "+") #'eat-tmux-manager-new)
     map)
   "Keymap for `eat-tmux-manager-mode'.")
 
