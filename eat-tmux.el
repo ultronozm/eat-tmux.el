@@ -24,22 +24,25 @@
 ;; `eat-tmux-open' opens or creates a tmux session for any directory.
 ;; `eat-tmux-manager' provides a tabulated session browser/jump UI.
 ;;
-;; Prefix argument behavior:
-;; - no prefix: attach/create view 1
-;; - numeric prefix N: attach/create view N
-;; - non-numeric prefix (for example C-u): create next free view index
+;; `eat-tmux-project' prefix argument behavior:
+;; - no prefix: attach or create view 1
+;; - numeric prefix N: attach or create view N
+;; - non-numeric prefix (e.g. C-u): create the next free view index
+;;
+;; Remote projects (TRAMP ssh/scp directories) are supported: the tmux
+;; session runs on the remote host via `ssh -tt'.
 ;;
 ;; Example setup:
 ;;
-;; (add-to-list 'load-path "/path/to/eat-tmux/")
-;; (require 'eat-tmux)
-;; (require 'project)
-;; (keymap-set project-prefix-map "t" #'eat-tmux-project)
-;; (add-to-list 'project-switch-commands '(eat-tmux-project "Tmux" nil))
+;;   (require 'eat-tmux)
+;;   (with-eval-after-load 'project
+;;     (keymap-set project-prefix-map "t" #'eat-tmux-project)
+;;     (add-to-list 'project-switch-commands
+;;                  '(eat-tmux-project "Tmux" nil)))
 ;;
-;; `eat-tmux-mode' (activated automatically by `eat-tmux-project', but
-;; usable elsewhere) binds `C-c C-v' to capture the current tmux
-;; pane's text into a `special-mode' buffer outside Eat char mode.
+;; `eat-tmux-mode' (activated automatically in buffers created by
+;; `eat-tmux-project' and `eat-tmux-open') binds `C-c C-v' to capture
+;; the current tmux pane's text into a `special-mode' buffer.
 
 ;;; Code:
 
