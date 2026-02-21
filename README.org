@@ -12,6 +12,10 @@ Open tmux sessions/views inside [[https://codeberg.org/akib/emacs-eat][Eat]] buf
 - =M-x eat-tmux-capture-pane=: capture the current tmux pane output to a =special-mode= buffer.
 - =M-x eat-tmux-manager=: browse tmux sessions in a tabulated manager UI.
 
+In =eat-tmux-manager=:
+
+- =D=: kill the session on the current row (with =y/n= confirmation).
+
 * Requirements
 
 - Emacs with the [[https://codeberg.org/akib/emacs-eat][eat]] package available

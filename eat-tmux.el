@@ -809,6 +809,27 @@ confused with tmux view indices."
         (apply #'process-lines "tmux" args)
       (error nil))))
 
+(defun eat-tmux--tmux-command-require-success (remote &rest args)
+  "Run tmux ARGS locally or on REMOTE, signaling on failure."
+  (if remote
+      (progn
+        (eat-tmux--remote-command-output-string
+         remote
+         (eat-tmux--shell-command (cons "tmux" args))
+         t)
+        t)
+    (with-temp-buffer
+      (let ((status (apply #'process-file "tmux" nil t nil args)))
+        (if (zerop status)
+            t
+          (user-error "Tmux command failed (%d): tmux %s%s"
+                      status
+                      (mapconcat #'identity args " ")
+                      (let ((msg (string-trim (buffer-string))))
+                        (if (string-empty-p msg)
+                            ""
+                          (format " (%s)" msg)))))))))
+
 (defun eat-tmux--list-sessions (&optional remote)
   "Return tmux session names locally or on REMOTE."
   (eat-tmux--tmux-command-lines remote
@@ -1298,7 +1319,8 @@ Uses `eat-tmux-manager-pane-state-alist'."
   (let* ((index (or (plist-get window :index) ""))
          (name (or (plist-get window :name) ""))
          (state (or (plist-get window :state) "idle"))
-         (label (format "%s:%s" index name)))
+         (active (plist-get window :active))
+         (label (format "%s:%s%s" index name (if active "*" ""))))
     (propertize label
                 'face (eat-tmux-manager--window-face state)
                 'help-echo (format "Window state: %s" state))))
@@ -1338,8 +1360,8 @@ Each value is a plist with keys:
     (dolist (line (eat-tmux--tmux-command-lines
                    remote
                    "list-panes" "-a" "-F"
-                   "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_active}\t#{pane_current_path}"))
-      (pcase-let* ((`(,session ,window-index ,window-name ,pane-id ,pane-active ,pane-path . ,_)
+                   "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_active}\t#{pane_current_path}\t#{window_active}"))
+      (pcase-let* ((`(,session ,window-index ,window-name ,pane-id ,pane-active ,pane-path ,window-active . ,_)
                     (split-string line "\t"))
                    (entry (or (and (stringp session) (gethash session table))
                               (list :path nil
@@ -1361,6 +1383,8 @@ Each value is a plist with keys:
                                   pane-state)))
               (setq window (plist-put window :name (or window-name "")))
               (setq window (plist-put window :state window-state))
+              (when (equal window-active "1")
+                (setq window (plist-put window :active t)))
               (puthash window-index window windows)))
           (puthash session entry table))))
     (maphash
@@ -1497,6 +1521,24 @@ Each value is a plist with keys:
                               default-directory)))
     (call-interactively #'eat-tmux-open)))
 
+(defun eat-tmux-manager-kill-session ()
+  "Kill tmux session at point after confirmation."
+  (interactive)
+  (let* ((record (eat-tmux-manager--current-record))
+         (session (plist-get record :session))
+         (remote (plist-get record :remote))
+         (source (or (plist-get record :source) "tmux")))
+    (unless (and (stringp session) (not (string-empty-p session)))
+      (user-error "Missing tmux session in row"))
+    (when (y-or-n-p (format "Kill tmux session %s on %s? " session source))
+      (if remote
+          (eat-tmux--ensure-ssh)
+        (eat-tmux--ensure-tmux))
+      (eat-tmux--tmux-command-require-success remote
+                                              "kill-session" "-t" session)
+      (eat-tmux-manager-refresh)
+      (message "Killed tmux session: %s" session))))
+
 (defvar eat-tmux-manager-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'eat-tmux-manager-refresh)
@@ -1504,6 +1546,7 @@ Each value is a plist with keys:
     (define-key map (kbd "v") #'eat-tmux-manager-visit)
     (define-key map (kbd "RET") #'eat-tmux-manager-visit)
     (define-key map (kbd "j") #'eat-tmux-manager-open-directory)
+    (define-key map (kbd "D") #'eat-tmux-manager-kill-session)
     (define-key map (kbd "+") #'eat-tmux-manager-new)
     map)
   "Keymap for `eat-tmux-manager-mode'.")
