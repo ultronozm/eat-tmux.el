@@ -1,4 +1,4 @@
-;;; eat-tmux.el --- Project tmux views in Eat -*- lexical-binding: t; -*-
+;;; eat-tmux.el --- Tmux views in Eat -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026  Paul D. Nelson
 
@@ -20,7 +20,7 @@
 
 ;;; Commentary:
 
-;; `eat-tmux' opens project-scoped tmux views inside Eat buffers.
+;; `eat-tmux-project' opens project-scoped tmux views inside Eat buffers.
 ;;
 ;; Prefix argument behavior:
 ;; - no prefix: attach/create view 1
@@ -32,11 +32,12 @@
 ;; (add-to-list 'load-path "/path/to/eat-tmux/")
 ;; (require 'eat-tmux)
 ;; (require 'project)
-;; (keymap-set project-prefix-map "t" #'eat-tmux)
-;; (add-to-list 'project-switch-commands '(eat-tmux "Tmux" nil))
+;; (keymap-set project-prefix-map "t" #'eat-tmux-project)
+;; (add-to-list 'project-switch-commands '(eat-tmux-project "Tmux" nil))
 ;;
-;; In `eat-tmux' buffers, `eat-tmux-mode' binds:
-;; - C-c C-v: `eat-tmux-capture-pane'
+;; `eat-tmux-mode' (activated automatically by `eat-tmux-project', but
+;; usable elsewhere) binds `C-c C-v' to capture the current tmux
+;; pane's text into a `special-mode' buffer.
 
 ;;; Code:
 
@@ -48,6 +49,7 @@
 (declare-function project-root "project" (project))
 
 (defvar eat-buffer-name)
+
 (defvar-local eat-tmux--session-base nil)
 (defvar-local eat-tmux--view-index nil)
 (defvar eat-tmux-mode-map
@@ -394,7 +396,7 @@ Otherwise, fall back to current eat-tmux session/view metadata."
   (eat-tmux-capture-pane))
 
 ;;;###autoload
-(defun eat-tmux (&optional arg)
+(defun eat-tmux-project (&optional arg)
   "Open a project-local tmux view in an Eat buffer.
 
 With no prefix ARG, attach/create view 1.
@@ -418,8 +420,8 @@ available view index."
     (when (< view-index 1)
       (user-error "View index must be >= 1"))
     (let* ((command (eat-tmux--command session-base
-                                           view-index
-                                           default-directory))
+                                       view-index
+                                       default-directory))
            (eat-buffer-name (project-prefixed-buffer-name "tmux"))
            (eat-arg (if arg view-index nil))
            (buffer (eat command eat-arg)))
