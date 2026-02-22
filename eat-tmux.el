@@ -951,14 +951,18 @@ otherwise create a fresh buffer and attach."
                                                           session-name))
              (base-buffer-name (plist-get buffer-info :base))
              (buffer-name (plist-get buffer-info :name))
-             ;; Use a local default-directory for remote contexts so
+             ;; For remote contexts, use a local default-directory so
              ;; eat's make-process does not go through TRAMP (which
              ;; would create a pipe instead of a real PTY, causing
              ;; tmux to fail with "not a terminal").  The SSH wrapper
              ;; with -tt handles PTY allocation on the remote side.
+             ;; For local contexts, use local-directory rather than
+             ;; default-directory which may still be a TRAMP path
+             ;; from the calling buffer (e.g. after C-x p p from a
+             ;; remote project).
              (launch-directory (if remote-context
                                    (expand-file-name "~")
-                                 default-directory))
+                                 local-directory))
              (tmux-command (eat-tmux--command session-base
                                               session-name
                                               view-index
