@@ -260,7 +260,7 @@ Keys are compared case-insensitively after trimming whitespace."
   :group 'eat-tmux)
 
 (defface eat-tmux-manager-window-running-face
-  '((t :inherit success))
+  '((t :inherit font-lock-keyword-face))
   "Face for manager windows with active pane activity."
   :group 'eat-tmux)
 
