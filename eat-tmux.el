@@ -171,6 +171,23 @@ The value can be one of:
           (const :tag "Error on remote projects" error))
   :group 'eat-tmux)
 
+(defcustom eat-tmux-ssh-probe-options
+  '("-o" "BatchMode=yes"
+    "-o" "ConnectTimeout=5")
+  "Additional ssh options for noninteractive remote probe commands.
+
+The options are used by helper commands such as $HOME resolution and
+remote tmux session discovery."
+  :type '(repeat string)
+  :group 'eat-tmux)
+
+(defcustom eat-tmux-ssh-probe-disable-askpass t
+  "When non-nil, disable ssh askpass for noninteractive remote probes.
+
+This avoids blocking GUI askpass prompts from `process-file' calls."
+  :type 'boolean
+  :group 'eat-tmux)
+
 (defcustom eat-tmux-manager-include-remote t
   "When non-nil, include remote tmux sessions in `eat-tmux-manager'."
   :type 'boolean
@@ -317,6 +334,16 @@ Keys are compared case-insensitively after trimming whitespace."
         (format "%s@%s" user host)
       host)))
 
+(defun eat-tmux--ssh-probe-args (remote remote-command)
+  "Return ssh argv for probing REMOTE with REMOTE-COMMAND."
+  (let ((port (plist-get remote :port)))
+    (append
+     eat-tmux-ssh-probe-options
+     (when (and (stringp port) (not (string-empty-p port)))
+       (list "-p" port))
+     (list (eat-tmux--ssh-target remote)
+           remote-command))))
+
 (defun eat-tmux--ssh-shell-command (remote remote-command &optional force-tty)
   "Return local shell command to run REMOTE-COMMAND over ssh.
 
@@ -343,11 +370,11 @@ When FORCE-TTY is non-nil, pass `-tt' to ssh."
 
 When REQUIRE-SUCCESS is non-nil, signal a user error if command fails."
   (with-temp-buffer
-    (let* ((port (plist-get remote :port))
-           (args (append (when (and (stringp port) (not (string-empty-p port)))
-                           (list "-p" port))
-                         (list (eat-tmux--ssh-target remote)
-                               remote-command)))
+    (let* ((args (eat-tmux--ssh-probe-args remote remote-command))
+           (process-environment
+            (if eat-tmux-ssh-probe-disable-askpass
+                (cons "SSH_ASKPASS_REQUIRE=never" process-environment)
+              process-environment))
            (status (apply #'process-file "ssh" nil t nil args)))
       (if (zerop status)
           (buffer-string)
