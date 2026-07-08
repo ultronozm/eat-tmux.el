@@ -2,6 +2,11 @@
 
 Open tmux sessions/views inside [[https://codeberg.org/akib/emacs-eat][Eat]] buffers, scoped to Emacs projects.
 
+* Installation
+
+Install =eat-tmux= from this repository with your preferred package manager,
+or place =eat-tmux.el= on your =load-path= and require it.
+
 * Commands
 
 - =M-x eat-tmux-project=: open or attach to the project tmux view.
